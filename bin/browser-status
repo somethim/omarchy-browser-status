@@ -20,7 +20,11 @@ import time
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "browser-status")
 KEEPER_ENABLED = os.path.join(STATE_DIR, "keeper-enabled")
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR
-LOGIN_MARKER = os.path.join(RUNTIME_DIR, "browser-status-login-started")
+# Per default browser and per session (the runtime dir is cleared at logout):
+# the pid the Quit button stopped, and when the keeper last started it.
+QUIT_MARKER = os.path.join(RUNTIME_DIR, "browser-status-quit-{}")
+ATTEMPT_MARKER = os.path.join(RUNTIME_DIR, "browser-status-attempt-{}")
+RELAUNCH_SECONDS = 60
 LOCK_FILE = os.path.join(RUNTIME_DIR, "browser-status.lock")
 CACHE_FILE = os.path.join(RUNTIME_DIR, "browser-status-dirs.json")
 SAMPLE_SECONDS = 0.5
@@ -415,8 +419,13 @@ def status():
 
 
 def quit_browser():
-    main = main_pid(browser_processes(browser()))
+    info = browser()
+    main = main_pid(browser_processes(info))
     if main is not None:
+        # Quit means quit: the keeper leaves this browser stopped until the
+        # user opens it again or logs in again.
+        with open(QUIT_MARKER.format(info["desktopId"]), "w") as handle:
+            handle.write(str(main))
         os.kill(main, signal.SIGTERM)
     return 0
 
@@ -454,26 +463,60 @@ def park(window):
                    capture_output=True, timeout=3)
 
 
-def keeper_ensure(login=False):
-    """Add the keeper to a running browser; at login (once per session), start the browser with only the keeper."""
+def read_marker(path):
+    data = read(path)
+    return data.decode(errors="replace").strip() if data is not None else None
+
+
+def retire_other_keepers(info):
+    """Close keeper windows left in browsers that are no longer the default."""
+    main = main_pid(browser_processes(info))
+    for client in hypr_clients() or []:
+        if KEEPER_CLASS_MARK in str(client.get("initialClass", "")) and client.get("pid") != main:
+            subprocess.run(["hyprctl", "dispatch", f"hl.dsp.window.close({{ window = 'address:{client.get('address')}' }})"],
+                           capture_output=True, timeout=3)
+
+
+def keeper_ensure():
+    """Keep the default browser running with its hidden keeper window.
+
+    Starts the browser in the background when it is not running (at login,
+    after the default browser changes, or after it closed or crashed), and adds
+    the keeper when the browser was opened without it. A browser stopped with
+    Quit stays stopped until it is opened again or the next login, and a
+    browser that will not start is retried at most once a minute.
+    """
     info = browser()
     if not info or info["family"] != "chromium" or not info["binary"] or not keeper_enabled():
         return 0
-    if login:
-        if os.path.exists(LOGIN_MARKER):
-            login = False
-        else:
-            open(LOGIN_MARKER, "w").close()
+    quit_marker = QUIT_MARKER.format(info["desktopId"])
+    attempt_marker = ATTEMPT_MARKER.format(info["desktopId"])
     # One bar widget runs per monitor; serialize so only one keeper is launched.
     with open(LOCK_FILE, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if main_pid(browser_processes(info)) is None and not login:
-            return 0
-        existing = keeper_windows(info)
-        if existing:
-            for window in existing:
-                park(window)
-            return 0
+        retire_other_keepers(info)
+        main = main_pid(browser_processes(info))
+        quit_pid = read_marker(quit_marker)
+        if main is None:
+            if quit_pid is not None:
+                return 0
+            try:
+                if time.time() - os.path.getmtime(attempt_marker) < RELAUNCH_SECONDS:
+                    return 0
+            except OSError:
+                pass
+            open(attempt_marker, "w").close()
+        else:
+            # A browser opened after Quit (a different process) lifts the hold.
+            if quit_pid is not None:
+                if quit_pid == str(main):
+                    return 0
+                os.remove(quit_marker)
+            existing = keeper_windows(info)
+            if existing:
+                for window in existing:
+                    park(window)
+                return 0
         launch([info["binary"], f"--app={KEEPER_URL}"])
         for _ in range(40):
             time.sleep(0.25)
@@ -511,10 +554,10 @@ def main():
     if command == "open":
         return open_window()
     if command == "keeper-ensure":
-        return keeper_ensure(login="--login" in sys.argv[2:])
+        return keeper_ensure()
     if command in ("keeper-on", "keeper-off"):
         return keeper_set(command == "keeper-on")
-    print(f"usage: {os.path.basename(sys.argv[0])} [status|info|open|quit|keeper-ensure [--login]|keeper-on|keeper-off]", file=sys.stderr)
+    print(f"usage: {os.path.basename(sys.argv[0])} [status|info|open|quit|keeper-ensure|keeper-on|keeper-off]", file=sys.stderr)
     return 2
 
 

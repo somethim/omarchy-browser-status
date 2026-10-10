@@ -51,10 +51,10 @@ BarWidget {
     return hours > 0 ? hours + "h " + minutes + "m" : minutes + "m"
   }
 
-  // At login, start the browser with only its hidden keeper window (when the
-  // keeper is on); the helper does this once per session, so shell reloads
-  // never relaunch a browser the user quit.
-  Component.onCompleted: act("keeper-ensure", "--login")
+  // With the keeper on, the helper keeps the default browser running in the
+  // background: at login, after the default changes, and after it closes or
+  // crashes. A browser stopped with Quit stays stopped until reopened.
+  Component.onCompleted: act("keeper-ensure")
   onPopupOpenChanged: if (popupOpen) refresh()
 
   Timer {
@@ -73,9 +73,10 @@ BarWidget {
       try { root.browserState = JSON.parse(String(probeOut.text || "{}")) }
       catch (error) { root.actionError = "Could not read browser status" }
       if (!root.running) root.popupOpen = false
-      // The browser was opened without the keeper: add it, so closing every
-      // visible window leaves it running for notifications.
-      else if (root.keeperEnabled && root.browserState.keeperActive === false) root.act("keeper-ensure")
+      // Not running, or opened without the keeper: let the helper start it in
+      // the background or add the keeper, so closing every visible window
+      // leaves it running for notifications.
+      if (root.keeperEnabled && (!root.running || root.browserState.keeperActive === false)) root.act("keeper-ensure")
     }
   }
 

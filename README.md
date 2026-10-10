@@ -24,8 +24,9 @@ omarchy plugin add https://github.com/somethim/omarchy-browser-status.git --enab
 
 Chromium browsers on Linux exit when their last window closes, and have no working background mode, so web notifications stop. With **Background notifications** on in the panel, the widget keeps one blank app window open (about one small renderer process) and parks it on the hidden `special:browser-keeper` workspace.
 
-- At login, the widget starts the browser with only the keeper window, once per session.
+- The widget keeps the default browser running in the background: it starts it with only the keeper window at login, after you change the default browser, and after the browser closes or crashes. If the browser will not start, it retries at most once a minute.
 - When the browser is opened any other way (launcher, link, web app), the widget adds the keeper within about 10 seconds.
+- After you change the default browser, the old browser's keeper window is closed, so only the default is kept alive.
 - **Quit** stops everything. The browser stays closed until you open it again or log in again.
 - Turning the switch off closes the keeper. The setting is stored in `~/.local/state/browser-status/keeper-enabled`.
 
