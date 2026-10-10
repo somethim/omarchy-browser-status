@@ -1,0 +1,522 @@
+#!/usr/bin/python3 -I
+"""Report the default browser's processes, memory, CPU, and windows as JSON for the bar.
+
+The browser is whatever the user set as default (xdg-settings). Chromium-family
+browsers (Brave, Chrome, Chromium, Vivaldi, Edge, ...) get a per-process-type
+breakdown from their --type flags; Firefox-family browsers (Firefox, LibreWolf,
+Zen, ...) from their -contentproc types.
+"""
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "browser-status")
+KEEPER_ENABLED = os.path.join(STATE_DIR, "keeper-enabled")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR
+LOGIN_MARKER = os.path.join(RUNTIME_DIR, "browser-status-login-started")
+LOCK_FILE = os.path.join(RUNTIME_DIR, "browser-status.lock")
+CACHE_FILE = os.path.join(RUNTIME_DIR, "browser-status-dirs.json")
+SAMPLE_SECONDS = 0.5
+TICKS = os.sysconf("SC_CLK_TCK")
+PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
+
+# Chromium on Linux exits when its last window closes and has no working
+# background mode, so the keeper is a blank app window parked on a hidden
+# special workspace. Chromium derives the window class from the URL, which is
+# how the keeper is recognised.
+KEEPER_URL = "data:text/html,<title>Browser Keeper</title>"
+KEEPER_CLASS_MARK = "Browser_Keeper"
+KEEPER_WORKSPACE = "special:browser-keeper"
+
+SHARED_BIN_DIRS = {"/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"}
+
+FIREFOX_FAMILY = ("firefox", "librewolf", "zen", "floorp", "waterfox", "mullvad", "torbrowser", "tor-browser", "icecat")
+
+# Where common packages install their real binaries, for browsers whose
+# launcher is a wrapper script and which have no open window to learn from.
+KNOWN_DIRS = {
+    "brave": ["/opt/brave-bin/", "/opt/brave.com/", "/opt/brave-origin-bin/", "/opt/brave-beta-bin/", "/opt/brave-nightly-bin/"],
+    "google-chrome": ["/opt/google/chrome/", "/opt/google/chrome-beta/", "/opt/google/chrome-unstable/"],
+    "chromium": ["/usr/lib/chromium/", "/usr/lib64/chromium/"],
+    "vivaldi": ["/opt/vivaldi/", "/opt/vivaldi-snapshot/"],
+    "microsoft-edge": ["/opt/microsoft/msedge/", "/opt/microsoft/msedge-beta/", "/opt/microsoft/msedge-dev/"],
+    "helium": ["/opt/helium-browser-bin/", "/opt/helium/"],
+    "thorium": ["/opt/chromium.org/thorium/"],
+    "firefox": ["/usr/lib/firefox/", "/usr/lib64/firefox/", "/opt/firefox/"],
+    "librewolf": ["/usr/lib/librewolf/", "/opt/librewolf/"],
+    "zen": ["/opt/zen-browser-bin/", "/opt/zen-browser/", "/opt/zen/"],
+    "floorp": ["/usr/lib/floorp/", "/opt/floorp/"],
+    "waterfox": ["/usr/lib/waterfox/", "/opt/waterfox/"],
+}
+
+CHROMIUM_UTILITY_LABELS = {
+    "network.mojom.NetworkService": "Network",
+    "storage.mojom.StorageService": "Storage",
+    "audio.mojom.AudioService": "Audio",
+    "video_capture.mojom.VideoCaptureService": "Video capture",
+    "data_decoder.mojom.DataDecoderService": "Data decoder",
+}
+
+FIREFOX_LABELS = {
+    "tab": "Tabs & frames",
+    "gpu": "GPU",
+    "rdd": "Media decoder",
+    "socket": "Network",
+    "utility": "Utility",
+    "forkserver": "Fork server",
+    "extension": "Extensions",
+}
+
+
+def read(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+# --- Default browser -------------------------------------------------------
+
+def data_dirs():
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    rest = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    return [home] + [d for d in rest.split(":") if d]
+
+
+def default_desktop_id():
+    for command in (["xdg-settings", "get", "default-web-browser"], ["xdg-mime", "query", "default", "x-scheme-handler/https"]):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        value = result.stdout.strip()
+        if value.endswith(".desktop"):
+            return value
+    return None
+
+
+def desktop_entry(desktop_id):
+    for base in data_dirs():
+        path = os.path.join(base, "applications", desktop_id)
+        text = read(path)
+        if text is None:
+            continue
+        entry, in_main = {}, False
+        for line in text.decode(errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                in_main = line == "[Desktop Entry]"
+                continue
+            if in_main and "=" in line:
+                key, value = line.split("=", 1)
+                entry.setdefault(key.strip(), value.strip())
+        return entry
+    return {}
+
+
+def exec_binary(entry):
+    try:
+        parts = shlex.split(entry.get("Exec", ""))
+    except ValueError:
+        return None
+    # Skip `env VAR=value` style prefixes.
+    while parts and (parts[0] == "env" or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", parts[0])):
+        parts.pop(0)
+    return parts[0] if parts else None
+
+
+def family_for(name):
+    lowered = name.lower()
+    return "firefox" if any(mark in lowered for mark in FIREFOX_FAMILY) else "chromium"
+
+
+def binary_dirs(binary, desktop_id):
+    """Directories holding the browser's real executables."""
+    dirs = []
+    path = shutil.which(binary) if binary else None
+    if path:
+        real = os.path.realpath(path)
+        head = read(real) or b""
+        if head.startswith(b"\x7fELF"):
+            # A binary in a shared bin directory is matched by its exact path,
+            # not by every program that happens to live next to it.
+            directory = os.path.dirname(real)
+            dirs.append(real if directory in SHARED_BIN_DIRS else directory + "/")
+        else:
+            # A wrapper script: take the install directories it points at.
+            for match in re.findall(rb"(/(?:opt|usr/lib64|usr/lib)/[^\s\"';$]+)", head):
+                candidate = match.decode(errors="replace")
+                directory = candidate if os.path.isdir(candidate) else os.path.dirname(candidate)
+                if os.path.isdir(directory) and directory not in ("/opt", "/usr/lib", "/usr/lib64"):
+                    dirs.append(directory.rstrip("/") + "/")
+    key = desktop_id.removesuffix(".desktop").lower()
+    for name, known in KNOWN_DIRS.items():
+        if key.startswith(name) or (binary and os.path.basename(binary).startswith(name)):
+            dirs.extend(d for d in known if os.path.isdir(d))
+    return unique_paths(dirs)
+
+
+def unique_paths(paths):
+    """Resolve symlinked directories (/usr/lib64 -> /usr/lib) and drop duplicates."""
+    resolved = []
+    for path in paths:
+        real = os.path.realpath(path) + ("/" if path.endswith("/") else "")
+        if real not in resolved:
+            resolved.append(real)
+    return resolved
+
+
+def learned_dirs(desktop_id, entry):
+    """Install directories learned from open windows, cached per session."""
+    cache = {}
+    try:
+        cache = json.loads(read(CACHE_FILE) or b"{}")
+    except ValueError:
+        pass
+    classes = {c.lower() for c in (entry.get("StartupWMClass"), desktop_id.removesuffix(".desktop")) if c}
+    for client in hypr_clients() or []:
+        if str(client.get("class", "")).lower() in classes or str(client.get("initialClass", "")).lower() in classes:
+            try:
+                exe = os.readlink(f"/proc/{client.get('pid')}/exe")
+            except OSError:
+                continue
+            directory = exe if os.path.dirname(exe) in SHARED_BIN_DIRS else os.path.dirname(exe) + "/"
+            if directory not in cache.get(desktop_id, []):
+                cache.setdefault(desktop_id, []).append(directory)
+                try:
+                    with open(CACHE_FILE, "w") as handle:
+                        json.dump(cache, handle)
+                except OSError:
+                    pass
+    return cache.get(desktop_id, [])
+
+
+def icon_path(name):
+    if not name:
+        return ""
+    if os.path.isabs(name):
+        return name if os.path.exists(name) else ""
+    for base in data_dirs():
+        for size in ("scalable", "256x256", "128x128", "96x96", "64x64", "48x48"):
+            for ext in ("svg", "png"):
+                candidate = os.path.join(base, "icons", "hicolor", size, "apps", f"{name}.{ext}")
+                if os.path.exists(candidate):
+                    return candidate
+        candidate = os.path.join(base, "pixmaps", f"{name}.png")
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def browser():
+    desktop_id = default_desktop_id()
+    if not desktop_id:
+        return None
+    entry = desktop_entry(desktop_id)
+    binary = exec_binary(entry)
+    name = entry.get("Name") or desktop_id.removesuffix(".desktop")
+    dirs = binary_dirs(binary, desktop_id) + learned_dirs(desktop_id, entry)
+    return {
+        "desktopId": desktop_id,
+        "name": name,
+        "binary": binary,
+        "family": family_for(f"{desktop_id} {binary or ''} {name}"),
+        "dirs": unique_paths(dirs),
+        "icon": icon_path(entry.get("Icon", "")),
+    }
+
+
+# --- Processes -------------------------------------------------------------
+
+def cpu_ticks(pid):
+    stat = read(f"/proc/{pid}/stat")
+    if stat is None:
+        return None
+    fields = stat.rsplit(b")", 1)[1].split()
+    # utime and stime are fields 14 and 15, the parent is field 4 and the start
+    # time field 22; the split starts at field 3.
+    return int(fields[11]) + int(fields[12]), int(fields[19]), int(fields[1])
+
+
+def memory_kb(pid):
+    rollup = read(f"/proc/{pid}/smaps_rollup")
+    if rollup:
+        for line in rollup.splitlines():
+            if line.startswith(b"Pss:"):
+                return int(line.split()[1])
+    statm = read(f"/proc/{pid}/statm")
+    return int(statm.split()[1]) * PAGE_KB if statm else 0
+
+
+def chromium_label(exe, args):
+    if exe.endswith("chrome_crashpad_handler"):
+        return "Crash handler"
+    flags = {}
+    for arg in args:
+        if arg.startswith("--") and "=" in arg:
+            key, value = arg[2:].split("=", 1)
+            flags[key] = value
+    kind = flags.get("type")
+    if kind is None:
+        return "Browser"
+    if kind == "gpu-process":
+        return "GPU"
+    if kind == "zygote":
+        return "Zygote"
+    if kind == "renderer":
+        if "--extension-process" in args:
+            return "Extensions"
+        if "--top-chrome-webui" in args:
+            return "Browser UI"
+        return "Tabs & frames"
+    if kind == "utility":
+        sub = flags.get("utility-sub-type", "")
+        return CHROMIUM_UTILITY_LABELS.get(sub, sub.split(".")[0].replace("_", " ").capitalize() or "Utility")
+    return kind.replace("-", " ").capitalize()
+
+
+def firefox_label(exe, args):
+    if exe.endswith("crashhelper") or "crashreporter" in exe:
+        return "Crash handler"
+    if "-contentproc" not in args:
+        return "Browser"
+    for arg in reversed(args):
+        if arg in FIREFOX_LABELS:
+            return FIREFOX_LABELS[arg]
+    return "Content"
+
+
+def browser_processes(info):
+    found = {}
+    if not info or not info["dirs"]:
+        return found
+    label_for = firefox_label if info["family"] == "firefox" else chromium_label
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            exe = os.readlink(f"/proc/{entry}/exe")
+        except OSError:
+            continue
+        if not any(exe == path or (path.endswith("/") and exe.startswith(path)) for path in info["dirs"]):
+            continue
+        cmdline = read(f"/proc/{entry}/cmdline") or b""
+        args = [part.decode(errors="replace") for part in cmdline.split(b"\0") if part]
+        # Chromium rewrites child argv into one space-separated string.
+        if len(args) == 1:
+            args = args[0].split()
+        found[int(entry)] = {"exe": exe, "args": args, "label": label_for(exe, args)}
+    return found
+
+
+def main_pid(processes):
+    """The browser process whose parent is not itself part of the browser."""
+    candidates = []
+    for pid, info in processes.items():
+        if info["label"] != "Browser":
+            continue
+        ticks = cpu_ticks(pid)
+        if ticks is None or ticks[2] in processes:
+            continue
+        candidates.append(pid)
+    return min(candidates) if candidates else None
+
+
+# --- Windows ---------------------------------------------------------------
+
+def hypr_clients():
+    try:
+        result = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=3)
+        return json.loads(result.stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def windows(pid):
+    """Windows owned by the main browser process, or None if Hyprland is unreachable."""
+    clients = hypr_clients()
+    if clients is None:
+        return None
+    return [
+        {
+            "title": client.get("title", ""),
+            "class": client.get("class", ""),
+            "address": client.get("address", ""),
+            "workspace": client.get("workspace", {}).get("name", ""),
+            "keeper": KEEPER_CLASS_MARK in str(client.get("initialClass", "")),
+        }
+        for client in clients
+        if pid is not None and client.get("pid") == pid
+    ]
+
+
+# --- Commands --------------------------------------------------------------
+
+def status():
+    info = browser()
+    processes = browser_processes(info)
+    before = {pid: cpu_ticks(pid) for pid in processes}
+    time.sleep(SAMPLE_SECONDS)
+    groups = {}
+    total_kb = 0
+    total_cpu = 0.0
+    alive = 0
+    for pid, proc in processes.items():
+        first, after = before.get(pid), cpu_ticks(pid)
+        if first is None or after is None:
+            continue
+        alive += 1
+        cpu = max(0, after[0] - first[0]) / TICKS / SAMPLE_SECONDS * 100
+        kb = memory_kb(pid)
+        group = groups.setdefault(proc["label"], {"label": proc["label"], "count": 0, "memoryMb": 0.0, "cpu": 0.0})
+        group["count"] += 1
+        group["memoryMb"] += kb / 1024
+        group["cpu"] += cpu
+        total_kb += kb
+        total_cpu += cpu
+
+    main = main_pid(processes)
+    uptime = None
+    if main is not None:
+        ticks = cpu_ticks(main)
+        uptime_text = read("/proc/uptime")
+        if ticks and uptime_text:
+            uptime = int(float(uptime_text.split()[0]) - ticks[1] / TICKS)
+
+    for group in groups.values():
+        group["memoryMb"] = round(group["memoryMb"], 1)
+        group["cpu"] = round(group["cpu"], 1)
+    all_windows = windows(main)
+    open_windows = None if all_windows is None else [window for window in all_windows if not window["keeper"]]
+    keeper_supported = bool(info) and info["family"] == "chromium"
+    return {
+        "browser": {k: info[k] for k in ("name", "desktopId", "family", "icon")} if info else None,
+        "running": main is not None,
+        "mainPid": main,
+        "uptimeSeconds": uptime,
+        "processCount": alive,
+        "memoryMb": round(total_kb / 1024, 1),
+        "cpu": round(total_cpu, 1),
+        "windows": open_windows if open_windows is not None else [],
+        "windowsKnown": open_windows is not None,
+        "keeperSupported": keeper_supported,
+        "keeperEnabled": keeper_supported and keeper_enabled(),
+        "keeperActive": any(window["keeper"] for window in all_windows or []),
+        "groups": sorted(groups.values(), key=lambda group: group["memoryMb"], reverse=True),
+    }
+
+
+def quit_browser():
+    main = main_pid(browser_processes(browser()))
+    if main is not None:
+        os.kill(main, signal.SIGTERM)
+    return 0
+
+
+def launch(args):
+    subprocess.Popen(["uwsm-app", "--", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def open_window():
+    if shutil.which("omarchy-launch-browser"):
+        subprocess.Popen(["omarchy-launch-browser"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return 0
+    info = browser()
+    if not info or not info["binary"]:
+        print("No default browser is set", file=sys.stderr)
+        return 1
+    launch([info["binary"]])
+    return 0
+
+
+def keeper_enabled():
+    return os.path.exists(KEEPER_ENABLED)
+
+
+def keeper_windows(info):
+    return [window for window in windows(main_pid(browser_processes(info))) or [] if window["keeper"]]
+
+
+def park(window):
+    """Move a keeper window to the hidden workspace, unless a window rule already did."""
+    if window["workspace"] == KEEPER_WORKSPACE:
+        return
+    subprocess.run(["hyprctl", "dispatch",
+                    f'hl.dsp.window.move({{ workspace = "{KEEPER_WORKSPACE}", follow = false, window = "address:{window["address"]}" }})'],
+                   capture_output=True, timeout=3)
+
+
+def keeper_ensure(login=False):
+    """Add the keeper to a running browser; at login (once per session), start the browser with only the keeper."""
+    info = browser()
+    if not info or info["family"] != "chromium" or not info["binary"] or not keeper_enabled():
+        return 0
+    if login:
+        if os.path.exists(LOGIN_MARKER):
+            login = False
+        else:
+            open(LOGIN_MARKER, "w").close()
+    # One bar widget runs per monitor; serialize so only one keeper is launched.
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if main_pid(browser_processes(info)) is None and not login:
+            return 0
+        existing = keeper_windows(info)
+        if existing:
+            for window in existing:
+                park(window)
+            return 0
+        launch([info["binary"], f"--app={KEEPER_URL}"])
+        for _ in range(40):
+            time.sleep(0.25)
+            existing = keeper_windows(info)
+            if existing:
+                for window in existing:
+                    park(window)
+                break
+    return 0
+
+
+def keeper_set(enabled):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if enabled:
+        open(KEEPER_ENABLED, "w").close()
+        return keeper_ensure()
+    if os.path.exists(KEEPER_ENABLED):
+        os.remove(KEEPER_ENABLED)
+    for window in keeper_windows(browser()):
+        subprocess.run(["hyprctl", "dispatch", f"hl.dsp.window.close({{ window = 'address:{window['address']}' }})"],
+                       capture_output=True, timeout=3)
+    return 0
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if command == "status":
+        print(json.dumps(status()))
+        return 0
+    if command == "info":
+        print(json.dumps(browser()))
+        return 0
+    if command == "quit":
+        return quit_browser()
+    if command == "open":
+        return open_window()
+    if command == "keeper-ensure":
+        return keeper_ensure(login="--login" in sys.argv[2:])
+    if command in ("keeper-on", "keeper-off"):
+        return keeper_set(command == "keeper-on")
+    print(f"usage: {os.path.basename(sys.argv[0])} [status|info|open|quit|keeper-ensure [--login]|keeper-on|keeper-off]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
