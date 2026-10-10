@@ -468,13 +468,42 @@ def read_marker(path):
     return data.decode(errors="replace").strip() if data is not None else None
 
 
+def owned_by_me(pid):
+    try:
+        return os.stat(f"/proc/{pid}").st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 def retire_other_keepers(info):
-    """Close keeper windows left in browsers that are no longer the default."""
+    """Stop keeping browsers that are no longer the default.
+
+    Closes their keeper windows; a browser that the keeper alone was keeping
+    alive (no other window left) is then shut down. A browser with real windows
+    open keeps running.
+    """
     main = main_pid(browser_processes(info))
+    retired = set()
     for client in hypr_clients() or []:
         if KEEPER_CLASS_MARK in str(client.get("initialClass", "")) and client.get("pid") != main:
             subprocess.run(["hyprctl", "dispatch", f"hl.dsp.window.close({{ window = 'address:{client.get('address')}' }})"],
                            capture_output=True, timeout=3)
+            retired.add(client.get("pid"))
+    if not retired:
+        return
+    # Chromium normally exits on its own once its last window closes; give it a
+    # moment, then stop any old browser that is still running windowless.
+    for _ in range(12):
+        time.sleep(0.25)
+        if not any(os.path.exists(f"/proc/{pid}") for pid in retired):
+            return
+    remaining = {client.get("pid") for client in hypr_clients() or []}
+    for pid in retired:
+        if pid not in remaining and os.path.exists(f"/proc/{pid}") and owned_by_me(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
 
 def keeper_ensure():

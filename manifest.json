@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "somethim.browser-status",
   "name": "Browser Status",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "somethim",
   "license": "MIT",
   "description": "Shows your default browser while it runs, with its windows, processes, memory, and CPU, and can keep Chromium browsers running for web notifications",
